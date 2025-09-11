@@ -1,16 +1,21 @@
 // ==UserScript==
 // @name         网页图片批量下载器
 // @namespace    http://tampermonkey.net/
-// @version      1.0
-// @description  自动检测并下载当前网页中的所有图片资源
+// @version      1.1
+// @description  自动检测并下载当前网页中的所有图片资源，支持自动下载模式
 // @author       You
 // @match        *://*/*
-// @grant        none
+// @grant        GM_setValue
+// @grant        GM_getValue
 // @run-at       document-end
 // ==/UserScript==
 
 (function() {
     'use strict';
+
+    // 全局变量
+    let autoDownloadEnabled = GM_getValue('autoDownloadEnabled', false);
+    let autoDownloadTimer = null;
 
     // 创建下载按钮和进度显示界面
     function createUI() {
@@ -39,6 +44,10 @@
                 <span id="image-count">检测到 0 张图片</span>
             </div>
             <div style="margin-bottom: 10px;">
+                <label style="display: flex; align-items: center; margin-bottom: 8px; font-size: 14px;">
+                    <input type="checkbox" id="auto-download-option" style="margin-right: 8px;" ${autoDownloadEnabled ? 'checked' : ''}>
+                    <span style="color: ${autoDownloadEnabled ? '#28a745' : '#333'}; font-weight: ${autoDownloadEnabled ? 'bold' : 'normal'};">🚀 自动下载模式</span>
+                </label>
                 <label style="display: flex; align-items: center; margin-bottom: 8px; font-size: 14px;">
                     <input type="checkbox" id="rename-option" style="margin-right: 8px;" checked>
                     <span>自动重命名文件</span>
@@ -72,6 +81,16 @@
                     cursor: pointer;
                 ">关闭</button>
             </div>
+            <div id="auto-status" style="
+                font-size: 12px;
+                color: #666;
+                margin-bottom: 8px;
+                display: ${autoDownloadEnabled ? 'block' : 'none'};
+                background: #e8f5e8;
+                padding: 4px 8px;
+                border-radius: 4px;
+                border-left: 3px solid #28a745;
+            ">🟢 自动下载已启用 - 新页面将自动下载图片</div>
             <div id="progress-container" style="display: none;">
                 <div style="margin-bottom: 5px;">下载进度:</div>
                 <div style="background: #f0f0f0; border-radius: 4px; overflow: hidden;">
@@ -238,8 +257,47 @@
         }
     }
 
+    // 自动下载功能
+    function startAutoDownload(imageUrls) {
+        if (imageUrls.length === 0) {
+            console.log('没有检测到图片，跳过自动下载');
+            return;
+        }
+        
+        console.log(`自动下载模式：开始下载 ${imageUrls.length} 张图片`);
+        const progressContainer = document.getElementById('progress-container');
+        const progressText = document.getElementById('progress-text');
+        
+        if (progressContainer) {
+            progressContainer.style.display = 'block';
+            progressText.textContent = '🚀 自动下载模式：正在下载图片...';
+        }
+        
+        downloadAllImages(imageUrls, true);
+    }
+
+    // 检查是否应该触发自动下载
+    function checkAutoDownload() {
+        if (!autoDownloadEnabled) return;
+        
+        // 延迟扫描，确保页面完全加载
+        autoDownloadTimer = setTimeout(() => {
+            const imageUrls = getAllImageUrls();
+            if (imageUrls.length > 0) {
+                startAutoDownload(imageUrls);
+            }
+        }, 2000); // 2秒延迟，让动态内容加载完成
+    }
+
+    // 取消自动下载定时器
+    function cancelAutoDownload() {
+        if (autoDownloadTimer) {
+            clearTimeout(autoDownloadTimer);
+            autoDownloadTimer = null;
+        }
+    }
     // 批量下载图片
-    async function downloadAllImages(imageUrls) {
+    async function downloadAllImages(imageUrls, isAutoMode = false) {
         const progressContainer = document.getElementById('progress-container');
         const progressBar = document.getElementById('progress-bar');
         const progressText = document.getElementById('progress-text');
@@ -247,7 +305,7 @@
         
         progressContainer.style.display = 'block';
         downloadBtn.disabled = true;
-        downloadBtn.textContent = '下载中...';
+        downloadBtn.textContent = isAutoMode ? '自动下载中...' : '下载中...';
         
         let completed = 0;
         let successful = 0;
@@ -275,14 +333,14 @@
             }
         }
         
-        progressText.textContent = `下载完成! 成功: ${successful}/${total}`;
+        progressText.textContent = `${isAutoMode ? '🚀 自动模式 - ' : ''}下载完成! 成功: ${successful}/${total}`;
         downloadBtn.disabled = false;
         downloadBtn.textContent = '下载全部';
         
-        // 3秒后隐藏进度条
+        // 3秒后隐藏进度条（自动模式下5秒）
         setTimeout(() => {
             progressContainer.style.display = 'none';
-        }, 3000);
+        }, isAutoMode ? 5000 : 3000);
     }
 
     // 从URL获取文件名
@@ -343,8 +401,34 @@
             }
         });
 
+        // 自动下载模式切换事件
+        document.getElementById('auto-download-option').addEventListener('change', (e) => {
+            autoDownloadEnabled = e.target.checked;
+            GM_setValue('autoDownloadEnabled', autoDownloadEnabled);
+            
+            const autoStatus = document.getElementById('auto-status');
+            const label = e.target.nextElementSibling;
+            
+            if (autoDownloadEnabled) {
+                autoStatus.style.display = 'block';
+                label.style.color = '#28a745';
+                label.style.fontWeight = 'bold';
+                console.log('🚀 自动下载模式已启用');
+                // 开启自动模式后，立即检查当前页面
+                checkAutoDownload();
+            } else {
+                autoStatus.style.display = 'none';
+                label.style.color = '#333';
+                label.style.fontWeight = 'normal';
+                console.log('⛔ 自动下载模式已关闭');
+                // 关闭自动模式时，取消待处理的下载
+                cancelAutoDownload();
+            }
+        });
+
         // 关闭按钮事件
         document.getElementById('close-btn').addEventListener('click', () => {
+            cancelAutoDownload();
             container.remove();
         });
 
@@ -352,6 +436,11 @@
         setTimeout(() => {
             document.getElementById('scan-btn').click();
         }, 1000);
+        
+        // 如果开启了自动下载模式，则检查是否需要自动下载
+        if (autoDownloadEnabled) {
+            checkAutoDownload();
+        }
     }
 
     // 启动脚本
