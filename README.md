@@ -1,7 +1,7 @@
 # 网页图片批量下载器 - 油猴脚本
 
 这是一个功能强大的油猴脚本，可以自动检测并批量下载当前网页中的所有图片资源。
-
+customer_adjustment_sync_advertiser_account
 ## 功能特性
 
 ✅ **全面图片检测**
