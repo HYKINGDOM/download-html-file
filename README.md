@@ -8,6 +8,23 @@
 - 支持新标签页和当前标签页
 - 智能延迟确保动态内容加载完成
 - 可随时切换手动/自动模式
+- 🔄 **滚动监听支持懒加载和瀑布流** 🆕
+  - 自动检测滚动时出现的新图片
+  - 支持懒加载（lazy loading）图片
+  - 支持瀑布流和无限滚动页面
+  - 使用 Intersection Observer 高效监测
+  - 智能去重，避免重复下载
+- 📏 **文件大小过滤** 🆕
+  - 默认过滤20KB以下的小文件（图标、缩略图等）
+  - 可自定义最小文件大小限制（1-1000KB）
+  - 可关闭过滤功能下载所有图片
+  - 智能统计跳过的小文件数量
+- 🆔 **智能去重机制** 🆕
+  - URL标准化处理，识别相同图片的不同URL格式
+  - 自动去除时间戳和随机参数
+  - 手动下载时检查已下载历史
+  - 滚动监听时精确识别新图片
+  - 实时显示去重统计信息
 
 ✅ **全面图片检测**
 - 自动遍历页面DOM结构，识别所有`<img>`标签
@@ -86,6 +103,12 @@
    - 2秒延迟后自动开始下载检测到的图片
    - 支持当前标签页和新打开的标签页
    - 下载进度显示"🚀 自动模式"标识
+   - 🔄 **滚动监听功能** 🆕：
+     - 自动启用滚动监听，检测用户滚动时出现的新图片
+     - 支持懒加载网站（如微博、Instagram、Pinterest等）
+     - 支持瀑布流和无限滚动页面
+     - 智能去重，不会重复下载相同图片
+     - 实时显示新检测到的图片数量（如：检测到 25 张图片（+5 新））
 
 3. **关闭自动模式**：
    - 取消勾选"🚀 自动下载模式"
@@ -96,6 +119,23 @@
    - 自动模式设置会被永久保存
    - 重新打开浏览器后仍然保持之前的设置
    - 可以在任何时候切换模式
+
+### 📏 文件大小过滤功能 🆕
+
+1. **默认过滤设置**：
+   - 默认开启文件大小过滤
+   - 默认过滤20KB以下的小文件
+   - 避免下载图标、小缩略图等无用文件
+
+2. **自定义过滤设置**：
+   - 在悬浮窗中可看到“📏 文件大小过滤”选项
+   - 可修改最小文件大小限制（1-1000KB）
+   - 可关闭过滤功能下载所有图片
+
+3. **过滤统计显示**：
+   - 下载完成后显示“成功: 15/20 (跳过5个小文件)”
+   - 控制台输出跳过的文件信息
+   - 帮助了解过滤效果
 
 ## 技术实现
 
@@ -115,6 +155,68 @@ for (let stylesheet of document.styleSheets) {
         // 检测CSS规则中的背景图片
     }
 }
+```
+
+### 智能去重机制 🆕
+
+```javascript
+// URL标准化处理，用于精准去重
+function normalizeUrl(url) {
+    const urlObj = new URL(url);
+    // 移除时间戳和随机参数
+    const paramsToRemove = ['t', 'timestamp', '_', 'v', 'cache', 'rand'];
+    paramsToRemove.forEach(param => {
+        urlObj.searchParams.delete(param);
+    });
+    
+    // 按字母顺序排列参数
+    const sortedParams = new URLSearchParams();
+    Array.from(urlObj.searchParams.keys()).sort().forEach(key => {
+        sortedParams.set(key, urlObj.searchParams.get(key));
+    });
+    urlObj.search = sortedParams.toString();
+    
+    return urlObj.href;
+}
+
+// 去重检查机制
+const filteredUrls = imageUrls.filter(url => {
+    const normalizedUrl = normalizeUrl(url);
+    return !downloadedImages.has(normalizedUrl);
+});
+```
+
+### 滚动监听和懒加载支持 🆕
+
+```javascript
+// 滚动事件监听和节流处理
+function handleScroll() {
+    if (scrollTimer) clearTimeout(scrollTimer);
+    scrollTimer = setTimeout(() => {
+        checkNewImagesAndDownload();
+    }, 500); // 500ms延迟检测
+}
+
+// 使用 Intersection Observer 高效监测新元素
+const observer = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+        if (entry.isIntersecting) {
+            // 检测到新图片元素可见
+            checkNewImagesAndDownload();
+        }
+    });
+}, { rootMargin: '50px' });
+
+// 监测新添加的DOM元素
+const mutationObserver = new MutationObserver((mutations) => {
+    mutations.forEach(mutation => {
+        mutation.addedNodes.forEach(node => {
+            if (node.tagName === 'IMG') {
+                observer.observe(node); // 监测新图片
+            }
+        });
+    });
+});
 ```
 
 ### 下载实现
@@ -186,7 +288,58 @@ A: 确认是否勾选了“🚀 自动下载模式”，并等待2秒让页面�
 **Q: 自动模式下载太频繁？**
 A: 可以随时关闭自动模式，或者在不需要的网站上使用手动模式
 
+**Q: 懒加载图片没有自动下载？** 🆕
+A: 确认已开启自动下载模式，然后慢慢滚动页面让图片加载出来
+
+**Q: 滚动时重复下载相同图片？**
+A: 脚本已内置去重机制，如仍有问题请检查浏览器控制台错误信息
+
+**Q: 瀑布流网站图片下载不全？**
+A: 请缓慢滚动让所有图片完全加载，或手动点击“扫描图片”重新检测
+
+**Q: 图片都被过滤了，下载不了？** 🆕
+A: 检查是否开启了文件大小过滤，可以关闭过滤或降低最小文件大小限制
+
+**Q: 如何调整文件大小过滤？**
+A: 在悬浮窗中找到“📏 文件大小过滤”，修改后面的数值（1-1000KB）或取消勾选
+
+**Q: 为什么显示跳过了很多文件？**
+A: 这些是小于设定大小的文件（通常是图标、小缩略图），如需要下载可关闭过滤
+
+**Q: 同一图片重复下载多次？** 🆕
+A: v1.4版本已修复此问题，现在支持智能去重，不会重复下载相同图片
+
+**Q: 去重机制如何工作？**
+A: 脚本会标准化URL（去除时间戳、排列参数），然后记录已下载的图片
+
+**Q: 如何清空去重记录？**
+A: 关闭并重新开启自动下载模式，或者关闭脚本悬浮窗后重新打开
+
 ## 版本历史
+
+- **v1.4** - 修复重复下载问题，新增智能去重机制 🆕
+  - 修复同一图片重复下载的问题
+  - 新增🆔URL标准化机制，精确识别相同图片
+  - 去除时间戳和随机参数，避免同一图片的不同URL被认为不同文件
+  - 手动下载支持去重检查，显示去重统计
+  - 优化滚动监听的去重逻辑
+  - 增强的错误处理和状态显示
+
+- **v1.3** - 新增文件大小过滤功能 🆕
+  - 新增📏文件大小过滤功能，默认过滤20KB以下小文件
+  - 可自定义最小文件大小限制（1-1000KB）
+  - 智能统计和显示跳过的小文件数量
+  - 避免下载图标、小缩略图等无用文件
+  - 控制台输出跳过文件的详细信息
+  - 优化用户界面，新增文件大小设置选项
+
+- **v1.2** - 新增滚动监听功能 🆕
+  - 新增🔄滚动监听功能，支持懒加载和瀑布流图片自动下载
+  - 使用 Intersection Observer 高效监测新出现的图片元素
+  - 智能去重机制，避免重复下载相同图片
+  - 支持滚动加载网站（微博、Instagram、Pinterest等）
+  - 优化节流处理，清理内存泄漏
+  - 实时显示新检测到的图片数量
 
 - **v1.1** - 新增自动下载模式 🆕
   - 新增🚀自动下载模式，支持打开新页面自动下载

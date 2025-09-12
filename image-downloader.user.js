@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         网页图片批量下载器
 // @namespace    http://tampermonkey.net/
-// @version      1.1
-// @description  自动检测并下载当前网页中的所有图片资源，支持自动下载模式
+// @version      1.4
+// @description  自动检测并下载当前网页中的所有图片资源，支持自动下载模式、滚动监听懒加载图片、文件大小过滤和智能去重
 // @author       You
 // @match        *://*/*
 // @grant        GM_setValue
@@ -16,6 +16,10 @@
     // 全局变量
     let autoDownloadEnabled = GM_getValue('autoDownloadEnabled', false);
     let autoDownloadTimer = null;
+    let downloadedImages = new Set(); // 记录已下载的图片URL，避免重复下载
+    let scrollMonitorEnabled = false; // 滚动监听状态
+    let scrollTimer = null; // 滚动节流定时器
+    let observer = null; // Intersection Observer 实例
 
     // 创建下载按钮和进度显示界面
     function createUI() {
@@ -51,6 +55,18 @@
                 <label style="display: flex; align-items: center; margin-bottom: 8px; font-size: 14px;">
                     <input type="checkbox" id="rename-option" style="margin-right: 8px;" checked>
                     <span>自动重命名文件</span>
+                </label>
+                <label style="display: flex; align-items: center; margin-bottom: 8px; font-size: 14px;">
+                    <input type="checkbox" id="size-filter-option" style="margin-right: 8px;" checked>
+                    <span>📏 文件大小过滤</span>
+                    <input type="number" id="min-size-input" value="100" min="1" max="1000" style="
+                        width: 50px;
+                        margin-left: 8px;
+                        padding: 2px 4px;
+                        border: 1px solid #ccc;
+                        border-radius: 3px;
+                        font-size: 12px;
+                    ">KB
                 </label>
             </div>
             <div style="margin-bottom: 10px;">
@@ -230,13 +246,53 @@
         return Array.from(imageUrls);
     }
 
-    // 下载单个图片
-    async function downloadImage(url, filename) {
+    // URL标准化函数，用于去重
+    function normalizeUrl(url) {
+        try {
+            const urlObj = new URL(url);
+            // 移除常见的时间戳和随机参数
+            const paramsToRemove = ['t', 'timestamp', '_', 'v', 'version', 'cache', 'cb', 'rand', 'random'];
+            paramsToRemove.forEach(param => {
+                urlObj.searchParams.delete(param);
+            });
+            
+            // 按字母顺序排列参数
+            const sortedParams = new URLSearchParams();
+            const sortedKeys = Array.from(urlObj.searchParams.keys()).sort();
+            sortedKeys.forEach(key => {
+                sortedParams.set(key, urlObj.searchParams.get(key));
+            });
+            
+            urlObj.search = sortedParams.toString();
+            // 统一使用https协议（如果原本是http的话）
+            if (urlObj.protocol === 'http:') {
+                urlObj.protocol = 'https:';
+            }
+            
+            return urlObj.href;
+        } catch (e) {
+            return url;
+        }
+    }
+    async function downloadImage(url, filename, skipSizeCheck = false) {
         try {
             const response = await fetch(url);
             if (!response.ok) throw new Error(`HTTP ${response.status}`);
             
             const blob = await response.blob();
+            
+            // 检查文件大小过滤
+            if (!skipSizeCheck) {
+                const sizeFilterEnabled = document.getElementById('size-filter-option')?.checked ?? true;
+                const minSizeKB = parseInt(document.getElementById('min-size-input')?.value || '100');
+                const fileSizeKB = blob.size / 1024;
+                
+                if (sizeFilterEnabled && fileSizeKB < minSizeKB) {
+                    console.log(`跳过小文件: ${filename} (${fileSizeKB.toFixed(1)}KB < ${minSizeKB}KB)`);
+                    return { skipped: true, reason: 'size', size: fileSizeKB };
+                }
+            }
+            
             const downloadUrl = URL.createObjectURL(blob);
             
             const a = document.createElement('a');
@@ -250,10 +306,10 @@
             // 清理URL对象
             setTimeout(() => URL.revokeObjectURL(downloadUrl), 1000);
             
-            return true;
+            return { success: true, size: blob.size / 1024 };
         } catch (error) {
             console.error(`下载失败 ${url}:`, error);
-            return false;
+            return { success: false, error: error.message };
         }
     }
 
@@ -274,6 +330,9 @@
         }
         
         downloadAllImages(imageUrls, true);
+        
+        // 启用滚动监听
+        enableScrollMonitor();
     }
 
     // 检查是否应该触发自动下载
@@ -296,6 +355,182 @@
             autoDownloadTimer = null;
         }
     }
+
+    // 滚动监听功能 - 检测新图片并自动下载
+    function handleScroll() {
+        if (!autoDownloadEnabled || !scrollMonitorEnabled) return;
+        
+        // 节流处理，避免频繁检测
+        if (scrollTimer) {
+            clearTimeout(scrollTimer);
+        }
+        
+        scrollTimer = setTimeout(() => {
+            checkNewImagesAndDownload();
+        }, 500); // 500ms延迟检测
+    }
+
+    // 检测新图片并下载
+    function checkNewImagesAndDownload() {
+        const currentImageUrls = getAllImageUrls();
+        const newImages = currentImageUrls.filter(url => {
+            const normalizedUrl = normalizeUrl(url);
+            return !downloadedImages.has(normalizedUrl);
+        });
+        
+        if (newImages.length > 0) {
+            console.log(`滚动检测到 ${newImages.length} 张新图片，开始下载...`);
+            
+            // 更新界面显示
+            const imageCount = document.getElementById('image-count');
+            const downloadBtn = document.getElementById('download-btn');
+            if (imageCount) {
+                imageCount.textContent = `检测到 ${currentImageUrls.length} 张图片（+${newImages.length} 新）`;
+            }
+            if (downloadBtn) {
+                downloadBtn.disabled = currentImageUrls.length === 0;
+            }
+            
+            // 下载新图片
+            downloadNewImages(newImages);
+        }
+    }
+
+    // 下载新检测到的图片
+    async function downloadNewImages(newImageUrls) {
+        const shouldRename = document.getElementById('rename-option')?.checked ?? true;
+        let successful = 0;
+        let skipped = 0;
+        
+        for (let i = 0; i < newImageUrls.length; i++) {
+            const url = newImageUrls[i];
+            const filename = getFilenameFromUrl(url, downloadedImages.size + i + 1, shouldRename);
+            
+            // 显示下载状态
+            const progressText = document.getElementById('progress-text');
+            if (progressText) {
+                progressText.textContent = `🔄 滚动检测 - 正在下载: ${filename}`;
+                const progressContainer = document.getElementById('progress-container');
+                if (progressContainer) {
+                    progressContainer.style.display = 'block';
+                }
+            }
+            
+            const result = await downloadImage(url, filename);
+            if (result.success) {
+                successful++;
+                // 下载成功后记录标准化的URL
+                const normalizedUrl = normalizeUrl(url);
+                downloadedImages.add(normalizedUrl);
+            } else if (result.skipped) {
+                skipped++;
+            }
+            
+            // 添加延迟避免浏览器阻止下载
+            if (i < newImageUrls.length - 1) {
+                await new Promise(resolve => setTimeout(resolve, 300));
+            }
+        }
+        
+        // 显示完成状态
+        const progressText = document.getElementById('progress-text');
+        if (progressText && newImageUrls.length > 0) {
+            let statusText = `🔄 滚动检测 - 新下载完成: ${successful}/${newImageUrls.length} 张图片`;
+            if (skipped > 0) {
+                statusText += ` (跳过${skipped}个小文件)`;
+            }
+            progressText.textContent = statusText;
+            // 3秒后隐藏提示
+            setTimeout(() => {
+                const progressContainer = document.getElementById('progress-container');
+                if (progressContainer) {
+                    progressContainer.style.display = 'none';
+                }
+            }, 3000);
+        }
+    }
+
+    // 启用滚动监听
+    function enableScrollMonitor() {
+        if (scrollMonitorEnabled) return;
+        
+        scrollMonitorEnabled = true;
+        
+        // 添加滚动事件监听
+        window.addEventListener('scroll', handleScroll, { passive: true });
+        
+        // 使用 Intersection Observer 监测新元素出现
+        if ('IntersectionObserver' in window) {
+            observer = new IntersectionObserver((entries) => {
+                if (!autoDownloadEnabled || !scrollMonitorEnabled) return;
+                
+                entries.forEach(entry => {
+                    if (entry.isIntersecting) {
+                        // 延迟检测，等待懒加载完成
+                        setTimeout(() => {
+                            checkNewImagesAndDownload();
+                        }, 1000);
+                    }
+                });
+            }, {
+                rootMargin: '50px' // 提前50px开始检测
+            });
+            
+            // 监测所有图片元素
+            document.querySelectorAll('img').forEach(img => {
+                observer.observe(img);
+            });
+            
+            // 监测新添加的图片元素
+            const mutationObserver = new MutationObserver((mutations) => {
+                mutations.forEach(mutation => {
+                    mutation.addedNodes.forEach(node => {
+                        if (node.nodeType === 1) { // Element node
+                            // 监测新添加的img元素
+                            if (node.tagName === 'IMG') {
+                                observer.observe(node);
+                            }
+                            // 监测子元素中的img
+                            node.querySelectorAll?.('img').forEach(img => {
+                                observer.observe(img);
+                            });
+                        }
+                    });
+                });
+            });
+            
+            mutationObserver.observe(document.body, {
+                childList: true,
+                subtree: true
+            });
+        }
+        
+        console.log('🔄 滚动监听已启用 - 支持懒加载和瀑布流图片自动下载');
+    }
+
+    // 禁用滚动监听
+    function disableScrollMonitor() {
+        if (!scrollMonitorEnabled) return;
+        
+        scrollMonitorEnabled = false;
+        
+        // 移除滚动事件监听
+        window.removeEventListener('scroll', handleScroll);
+        
+        // 清理定时器
+        if (scrollTimer) {
+            clearTimeout(scrollTimer);
+            scrollTimer = null;
+        }
+        
+        // 清理 Intersection Observer
+        if (observer) {
+            observer.disconnect();
+            observer = null;
+        }
+        
+        console.log('⛔ 滚动监听已禁用');
+    }
     // 批量下载图片
     async function downloadAllImages(imageUrls, isAutoMode = false) {
         const progressContainer = document.getElementById('progress-container');
@@ -303,24 +538,63 @@
         const progressText = document.getElementById('progress-text');
         const downloadBtn = document.getElementById('download-btn');
         
+        // 在手动模式下进行去重检查
+        let filteredUrls = imageUrls;
+        let duplicateCount = 0;
+        
+        if (!isAutoMode) {
+            filteredUrls = [];
+            for (const url of imageUrls) {
+                const normalizedUrl = normalizeUrl(url);
+                if (!downloadedImages.has(normalizedUrl)) {
+                    filteredUrls.push(url);
+                } else {
+                    duplicateCount++;
+                }
+            }
+            
+            if (duplicateCount > 0) {
+                console.log(`去重检查: 跳过 ${duplicateCount} 个已下载的图片`);
+            }
+        }
+        
         progressContainer.style.display = 'block';
         downloadBtn.disabled = true;
         downloadBtn.textContent = isAutoMode ? '自动下载中...' : '下载中...';
         
         let completed = 0;
         let successful = 0;
-        const total = imageUrls.length;
+        let skipped = 0;
+        const total = filteredUrls.length;
+        
+        if (total === 0) {
+            let statusText = duplicateCount > 0 ? `所有图片已下载过，跳过 ${duplicateCount} 个重复文件` : '没有可下载的图片';
+            progressText.textContent = statusText;
+            downloadBtn.disabled = false;
+            downloadBtn.textContent = '下载全部';
+            setTimeout(() => {
+                progressContainer.style.display = 'none';
+            }, 3000);
+            return;
+        }
         
         const shouldRename = document.getElementById('rename-option').checked;
         
-        for (let i = 0; i < imageUrls.length; i++) {
-            const url = imageUrls[i];
+        for (let i = 0; i < filteredUrls.length; i++) {
+            const url = filteredUrls[i];
             const filename = getFilenameFromUrl(url, i + 1, shouldRename);
             
             progressText.textContent = `正在下载: ${filename}`;
             
-            const success = await downloadImage(url, filename);
-            if (success) successful++;
+            const result = await downloadImage(url, filename);
+            if (result.success) {
+                successful++;
+                // 下载成功后记录URL
+                const normalizedUrl = normalizeUrl(url);
+                downloadedImages.add(normalizedUrl);
+            } else if (result.skipped) {
+                skipped++;
+            }
             
             completed++;
             const percentage = Math.round((completed / total) * 100);
@@ -328,12 +602,19 @@
             progressBar.textContent = percentage + '%';
             
             // 添加延迟避免浏览器阻止下载
-            if (i < imageUrls.length - 1) {
+            if (i < filteredUrls.length - 1) {
                 await new Promise(resolve => setTimeout(resolve, 200));
             }
         }
         
-        progressText.textContent = `${isAutoMode ? '🚀 自动模式 - ' : ''}下载完成! 成功: ${successful}/${total}`;
+        let statusText = `${isAutoMode ? '🚀 自动模式 - ' : ''}下载完成! 成功: ${successful}/${total}`;
+        if (skipped > 0) {
+            statusText += ` (跳过${skipped}个小文件)`;
+        }
+        if (duplicateCount > 0) {
+            statusText += ` (去重${duplicateCount}个)`;
+        }
+        progressText.textContent = statusText;
         downloadBtn.disabled = false;
         downloadBtn.textContent = '下载全部';
         
@@ -411,9 +692,10 @@
             
             if (autoDownloadEnabled) {
                 autoStatus.style.display = 'block';
+                autoStatus.textContent = '🔑 自动下载已启用 - 支持滚动检测懒加载图片';
                 label.style.color = '#28a745';
                 label.style.fontWeight = 'bold';
-                console.log('🚀 自动下载模式已启用');
+                console.log('🚀 自动下载模式已启用（含滚动监听）');
                 // 开启自动模式后，立即检查当前页面
                 checkAutoDownload();
             } else {
@@ -421,14 +703,18 @@
                 label.style.color = '#333';
                 label.style.fontWeight = 'normal';
                 console.log('⛔ 自动下载模式已关闭');
-                // 关闭自动模式时，取消待处理的下载
+                // 关闭自动模式时，取消待处理的下载和滚动监听
                 cancelAutoDownload();
+                disableScrollMonitor();
+                // 清空已下载记录
+                downloadedImages.clear();
             }
         });
 
         // 关闭按钮事件
         document.getElementById('close-btn').addEventListener('click', () => {
             cancelAutoDownload();
+            disableScrollMonitor();
             container.remove();
         });
 
