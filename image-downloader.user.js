@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         网页图片批量下载器
 // @namespace    http://tampermonkey.net/
-// @version      1.5
-// @description  自动检测并下载当前网页中的所有图片资源，支持自动下载模式、滚动监听懒加载图片、文件大小过滤和智能去重
+// @version      1.9
+// @description  自动检测并下载当前网页中的所有图片资源，支持自动下载模式、滚动监听懒加载图片、文件大小过滤和基于文件hash的智能去重
 // @author       You
 // @match        *://*/*
 // @grant        GM_setValue
@@ -143,11 +143,13 @@
     // 全局变量
     let autoDownloadEnabled = GM_getValue('autoDownloadEnabled', false);
     let autoDownloadTimer = null;
-    let downloadedImagesBloom = null; // 布隆过滤器实例
-    let downloadedImagesSet = new Set(); // 备用精确检查集合（用于小数据量或关键检查）
+    let downloadedImagesBloom = null; // 布隆过滤器实例（存储文件hash）
+    let downloadedHashesSet = new Set(); // 精确检查集合（存储文件hash）
+    let downloadedUrlsSet = new Set(); // URL去重集合（用于快速URL检查）
     let scrollMonitorEnabled = false; // 滚动监听状态
     let scrollTimer = null; // 滚动节流定时器
     let observer = null; // Intersection Observer 实例
+    let downloadedFilenames = new Set(); // 已下载的文件名集合（保留以防文件名冲突）
 
     // 创建下载按钮和进度显示界面
     function createUI() {
@@ -174,6 +176,7 @@
             </div>
             <div style="margin-bottom: 10px;">
                 <span id="image-count">检测到 0 张图片</span>
+                <span id="downloaded-count" style="font-size: 12px; color: #666; margin-left: 10px;">(已下载: 0)</span>
             </div>
             <div style="margin-bottom: 10px;">
                 <label style="display: flex; align-items: center; margin-bottom: 8px; font-size: 14px;">
@@ -197,33 +200,55 @@
                     ">KB
                 </label>
             </div>
-            <div style="margin-bottom: 10px;">
+            <div style="margin-bottom: 10px; display: flex; flex-wrap: nowrap; gap: 4px;">
                 <button id="scan-btn" style="
                     background: #007cba;
                     color: white;
                     border: none;
-                    padding: 8px 16px;
+                    padding: 6px 10px;
                     border-radius: 4px;
                     cursor: pointer;
-                    margin-right: 8px;
+                    font-size: 12px;
+                    flex: 1;
+                    min-width: 60px;
+                    white-space: nowrap;
                 ">扫描图片</button>
                 <button id="download-btn" style="
                     background: #28a745;
                     color: white;
                     border: none;
-                    padding: 8px 16px;
+                    padding: 6px 10px;
                     border-radius: 4px;
                     cursor: pointer;
-                    margin-right: 8px;
+                    font-size: 12px;
+                    flex: 1;
+                    min-width: 60px;
+                    white-space: nowrap;
                 " disabled>下载全部</button>
                 <button id="close-btn" style="
                     background: #dc3545;
                     color: white;
                     border: none;
-                    padding: 8px 16px;
+                    padding: 6px 10px;
                     border-radius: 4px;
                     cursor: pointer;
+                    font-size: 12px;
+                    flex: 1;
+                    min-width: 40px;
+                    white-space: nowrap;
                 ">关闭</button>
+                <button id="clear-history-btn" style="
+                    background: #ffc107;
+                    color: #333;
+                    border: none;
+                    padding: 6px 10px;
+                    border-radius: 4px;
+                    cursor: pointer;
+                    font-size: 12px;
+                    flex: 1;
+                    min-width: 60px;
+                    white-space: nowrap;
+                ">清空记录</button>
             </div>
             <div id="auto-status" style="
                 font-size: 12px;
@@ -378,10 +403,24 @@
     function normalizeUrl(url) {
         try {
             const urlObj = new URL(url);
-            // 移除常见的时间戳和随机参数
-            const paramsToRemove = ['t', 'timestamp', '_', 'v', 'version', 'cache', 'cb', 'rand', 'random'];
+            
+            // 移除常见的时间戳和随机参数，扩大参数列表
+            const paramsToRemove = [
+                't', 'timestamp', '_', 'v', 'version', 'cache', 'cb', 'rand', 'random',
+                'nocache', 'bust', 'ts', 'time', 'r', 'rnd', 'seed', 'x', 'y',
+                'token', 'auth', 'session', 'sid', 'uid', 'id', 'ref', 'from'
+            ];
+            
             paramsToRemove.forEach(param => {
                 urlObj.searchParams.delete(param);
+            });
+            
+            // 移除以数字开头的参数（通常是时间戳）
+            const allParams = Array.from(urlObj.searchParams.keys());
+            allParams.forEach(key => {
+                if (/^\d+$/.test(key) && key.length > 8) {
+                    urlObj.searchParams.delete(key);
+                }
             });
             
             // 按字母顺序排列参数
@@ -392,13 +431,26 @@
             });
             
             urlObj.search = sortedParams.toString();
+            
             // 统一使用https协议（如果原本是http的话）
             if (urlObj.protocol === 'http:') {
                 urlObj.protocol = 'https:';
             }
             
+            // 移除端口号（如果是默认端口）
+            if ((urlObj.protocol === 'https:' && urlObj.port === '443') || 
+                (urlObj.protocol === 'http:' && urlObj.port === '80')) {
+                urlObj.port = '';
+            }
+            
+            // 移除URL末尾的斜杠
+            if (urlObj.pathname.endsWith('/') && urlObj.pathname.length > 1) {
+                urlObj.pathname = urlObj.pathname.slice(0, -1);
+            }
+            
             return urlObj.href;
         } catch (e) {
+            console.warn('URL标准化失败:', url, e);
             return url;
         }
     }
@@ -408,6 +460,13 @@
             if (!response.ok) throw new Error(`HTTP ${response.status}`);
             
             const blob = await response.blob();
+            
+            // 计算文件hash进行内容去重检查
+            const fileHash = await calculateFileHash(blob);
+            if (isFileHashExists(fileHash)) {
+                console.log(`跳过重复文件 (hash相同): ${filename}, hash: ${fileHash.substring(0, 16)}...`);
+                return { skipped: true, reason: 'duplicate_hash', hash: fileHash };
+            }
             
             // 检查文件大小过滤
             if (!skipSizeCheck) {
@@ -434,7 +493,10 @@
             // 清理URL对象
             setTimeout(() => URL.revokeObjectURL(downloadUrl), 1000);
             
-            return { success: true, size: blob.size / 1024 };
+            // 下载成功后记录hash
+            markFileHashAsDownloaded(fileHash, url);
+            
+            return { success: true, size: blob.size / 1024, hash: fileHash };
         } catch (error) {
             console.error(`下载失败 ${url}:`, error);
             return { success: false, error: error.message };
@@ -448,16 +510,38 @@
             return;
         }
         
-        console.log(`自动下载模式：开始下载 ${imageUrls.length} 张图片`);
+        // 自动模式下也进行去重检查
+        const filteredUrls = imageUrls.filter(url => {
+            return !isAlreadyDownloaded(url);
+        });
+        
+        const duplicateCount = imageUrls.length - filteredUrls.length;
+        
+        console.log(`自动下载模式：检测到 ${imageUrls.length} 张图片，去重后 ${filteredUrls.length} 张`);
+        if (duplicateCount > 0) {
+            console.log(`自动模式去重：跳过 ${duplicateCount} 个已下载的图片`);
+        }
+        
+        if (filteredUrls.length === 0) {
+            console.log('所有图片都已下载过，跳过自动下载');
+            // 仍然启用滚动监听以检测新图片
+            enableScrollMonitor();
+            return;
+        }
+        
         const progressContainer = document.getElementById('progress-container');
         const progressText = document.getElementById('progress-text');
         
         if (progressContainer) {
             progressContainer.style.display = 'block';
-            progressText.textContent = '🚀 自动下载模式：正在下载图片...';
+            let statusText = `🚀 自动下载模式：正在下载 ${filteredUrls.length} 张图片`;
+            if (duplicateCount > 0) {
+                statusText += `（已去重 ${duplicateCount} 张）`;
+            }
+            progressText.textContent = statusText;
         }
         
-        downloadAllImages(imageUrls, true);
+        downloadAllImages(filteredUrls, true);
         
         // 启用滚动监听
         enableScrollMonitor();
@@ -501,53 +585,78 @@
     // 初始化布隆过滤器
     function initializeBloomFilter() {
         try {
-            // 尝试从存储中恢复布隆过滤器
-            const savedFilter = GM_getValue('downloadedImagesBloom', null);
+            // 尝试从存储中恢复布隆过滤器（存储文件hash）
+            const savedFilter = GM_getValue('downloadedHashesBloom', null);
             if (savedFilter) {
                 downloadedImagesBloom = BloomFilter.deserialize(savedFilter);
-                console.log('布隆过滤器已从存储中恢复，填充率:', (downloadedImagesBloom.getFillRatio() * 100).toFixed(2) + '%');
+                console.log('文件hash布隆过滤器已从存储中恢复，填充率:', (downloadedImagesBloom.getFillRatio() * 100).toFixed(2) + '%');
             } else {
                 downloadedImagesBloom = new BloomFilter(10000, 0.01);
-                console.log('创建新的布隆过滤器');
+                console.log('创建新的文件hash布隆过滤器');
             }
             
-            // 恢复精确检查集合（用于小数据量时的备用检查）
-            const savedSet = GM_getValue('downloadedImagesSet', []);
-            downloadedImagesSet = new Set(savedSet);
+            // 恢复精确检查集合（存储文件hash）
+            const savedHashesSet = GM_getValue('downloadedHashesSet', []);
+            downloadedHashesSet = new Set(savedHashesSet);
+            
+            // 恢复 URL 集合（用于快速初步检查）
+            const savedUrlsSet = GM_getValue('downloadedUrlsSet', []);
+            downloadedUrlsSet = new Set(savedUrlsSet);
+            
+            console.log(`已加载已下载记录: ${downloadedHashesSet.size} 个hash, ${downloadedUrlsSet.size} 个URL`);
             
         } catch (e) {
             console.error('初始化布隆过滤器失败:', e);
             downloadedImagesBloom = new BloomFilter(10000, 0.01);
-            downloadedImagesSet = new Set();
+            downloadedHashesSet = new Set();
+            downloadedUrlsSet = new Set();
         }
     }
     
     // 保存布隆过滤器到存储
     function saveBloomFilter() {
         try {
-            GM_setValue('downloadedImagesBloom', downloadedImagesBloom.serialize());
-            // 只保存最近的1000个URL到精确集合中
-            const setArray = Array.from(downloadedImagesSet);
-            const recentUrls = setArray.slice(-1000);
-            GM_setValue('downloadedImagesSet', recentUrls);
+            GM_setValue('downloadedHashesBloom', downloadedImagesBloom.serialize());
+            // 保存最近的1000个hash到精确集合中
+            const hashesArray = Array.from(downloadedHashesSet);
+            const recentHashes = hashesArray.slice(-1000);
+            GM_setValue('downloadedHashesSet', recentHashes);
+            
+            // 保存最近的1000个URL到URL集合中
+            const urlsArray = Array.from(downloadedUrlsSet);
+            const recentUrls = urlsArray.slice(-1000);
+            GM_setValue('downloadedUrlsSet', recentUrls);
         } catch (e) {
             console.error('保存布隆过滤器失败:', e);
         }
     }
     
-    // 检查图片是否已下载（使用布隆过滤器优化）
-    function isAlreadyDownloaded(url) {
-        const normalizedUrl = normalizeUrl(url);
-        
+    // 计算文件内容的SHA-256哈希值
+    async function calculateFileHash(blob) {
+        try {
+            const arrayBuffer = await blob.arrayBuffer();
+            const hashBuffer = await crypto.subtle.digest('SHA-256', arrayBuffer);
+            const hashArray = Array.from(new Uint8Array(hashBuffer));
+            const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+            return hashHex;
+        } catch (e) {
+            console.error('计算文件hash失败:', e);
+            // 如果hash计算失败，返回一个基于文件大小和时间戳的简单标识
+            return `size_${blob.size}_${Date.now()}`;
+        }
+    }
+    
+    // 检查文件hash是否已存在（使用布隆过滤器优化）
+    function isFileHashExists(fileHash) {
         // 首先使用布隆过滤器进行快速检查
-        if (!downloadedImagesBloom.mightContain(normalizedUrl)) {
+        if (!downloadedImagesBloom.mightContain(fileHash)) {
             // 布隆过滤器说不存在，那就肯定不存在
             return false;
         }
         
         // 布隆过滤器说可能存在，进行精确检查
         // 优先使用内存中的Set进行检查（最快）
-        if (downloadedImagesSet.has(normalizedUrl)) {
+        if (downloadedHashesSet.has(fileHash)) {
             return true;
         }
         
@@ -556,9 +665,42 @@
         return false;
     }
     
+    // 添加文件hash到已下载列表
+    function markFileHashAsDownloaded(fileHash, url) {
+        // 添加到布隆过滤器
+        downloadedImagesBloom.add(fileHash);
+        
+        // 添加到精确检查集合
+        downloadedHashesSet.add(fileHash);
+        
+        // 同时记录URL（用于快速初步检查）
+        const normalizedUrl = normalizeUrl(url);
+        downloadedUrlsSet.add(normalizedUrl);
+        
+        // 定期保存到存储
+        if (downloadedHashesSet.size % 50 === 0) {
+            saveBloomFilter();
+        }
+    }
+    
+    // 检查图片是否已下载（优先使用URL快速检查，然后使用hash精确检查）
+    function isAlreadyDownloaded(url) {
+        const normalizedUrl = normalizeUrl(url);
+        
+        // 首先进行URL快速检查（避免重复下载相同URL）
+        if (downloadedUrlsSet.has(normalizedUrl)) {
+            console.log('URL去重检查: 图片URL已存在:', normalizedUrl);
+            return true;
+        }
+        
+        return false; // URL未下载过，继续进行文件内容检查
+    }
+    
     // 添加图片到已下载列表
     function markAsDownloaded(url) {
         const normalizedUrl = normalizeUrl(url);
+        
+        console.log('标记为已下载:', normalizedUrl);
         
         // 添加到布隆过滤器
         downloadedImagesBloom.add(normalizedUrl);
@@ -567,8 +709,9 @@
         downloadedImagesSet.add(normalizedUrl);
         
         // 定期保存到存储
-        if (downloadedImagesSet.size % 50 === 0) {
+        if (downloadedImagesSet.size % 20 === 0) {
             saveBloomFilter();
+            console.log(`已保存去重数据，当前已下载 ${downloadedImagesSet.size} 张图片`);
         }
     }
 
@@ -602,10 +745,12 @@
         const shouldRename = document.getElementById('rename-option')?.checked ?? true;
         let successful = 0;
         let skipped = 0;
+        let duplicate = 0;
         
         for (let i = 0; i < newImageUrls.length; i++) {
             const url = newImageUrls[i];
-            const filename = getFilenameFromUrl(url, downloadedImages.size + i + 1, shouldRename);
+            const baseFilename = getFilenameFromUrl(url, downloadedHashesSet.size + i + 1, shouldRename);
+            const filename = ensureUniqueFilename(baseFilename);
             
             // 显示下载状态
             const progressText = document.getElementById('progress-text');
@@ -620,10 +765,12 @@
             const result = await downloadImage(url, filename);
             if (result.success) {
                 successful++;
-                // 下载成功后记录到布隆过滤器
-                markAsDownloaded(url);
+                // hash已在downloadImage内部记录
             } else if (result.skipped) {
                 skipped++;
+                if (result.reason === 'duplicate_hash') {
+                    duplicate++;
+                }
             }
             
             // 添加延迟避免浏览器阻止下载
@@ -637,7 +784,14 @@
         if (progressText && newImageUrls.length > 0) {
             let statusText = `🔄 滚动检测 - 新下载完成: ${successful}/${newImageUrls.length} 张图片`;
             if (skipped > 0) {
-                statusText += ` (跳过${skipped}个小文件)`;
+                statusText += ` (跳过${skipped}个小文件`;
+                if (duplicate > 0) {
+                    statusText += `, 去重${duplicate}个)`;
+                } else {
+                    statusText += ')';
+                }
+            } else if (duplicate > 0) {
+                statusText += ` (去重${duplicate}个)`;
             }
             progressText.textContent = statusText;
             // 3秒后隐藏提示
@@ -738,23 +892,21 @@
         const progressText = document.getElementById('progress-text');
         const downloadBtn = document.getElementById('download-btn');
         
-        // 在手动模式下进行去重检查
-        let filteredUrls = imageUrls;
+        // 无论手动还是自动模式，都进行去重检查
+        let filteredUrls = [];
         let duplicateCount = 0;
         
-        if (!isAutoMode) {
-            filteredUrls = [];
-            for (const url of imageUrls) {
-                if (!isAlreadyDownloaded(url)) {
-                    filteredUrls.push(url);
-                } else {
-                    duplicateCount++;
-                }
+        for (const url of imageUrls) {
+            if (!isAlreadyDownloaded(url)) {
+                filteredUrls.push(url);
+            } else {
+                duplicateCount++;
             }
-            
-            if (duplicateCount > 0) {
-                console.log(`去重检查: 跳过 ${duplicateCount} 个已下载的图片`);
-            }
+        }
+        
+        if (duplicateCount > 0) {
+            const modeText = isAutoMode ? '自动模式' : '手动模式';
+            console.log(`${modeText}去重检查: 跳过 ${duplicateCount} 个已下载的图片`);
         }
         
         progressContainer.style.display = 'block';
@@ -781,17 +933,21 @@
         
         for (let i = 0; i < filteredUrls.length; i++) {
             const url = filteredUrls[i];
-            const filename = getFilenameFromUrl(url, i + 1, shouldRename);
+            const baseFilename = getFilenameFromUrl(url, i + 1, shouldRename);
+            const filename = ensureUniqueFilename(baseFilename);
             
             progressText.textContent = `正在下载: ${filename}`;
             
             const result = await downloadImage(url, filename);
+            let duplicate = 0;
             if (result.success) {
                 successful++;
-                // 下载成功后记录到布隆过滤器
-                markAsDownloaded(url);
+                // hash已在downloadImage内部记录
             } else if (result.skipped) {
                 skipped++;
+                if (result.reason === 'duplicate_hash') {
+                    duplicate++;
+                }
             }
             
             completed++;
@@ -833,16 +989,29 @@
             if (shouldRename || !filename || !filename.includes('.')) {
                 const extension = getImageExtension(url);
                 const domain = urlObj.hostname.replace(/^www\./, '');
-                const timestamp = new Date().toISOString().slice(0, 19).replace(/[:-]/g, '');
-                filename = `${domain}_image_${index}_${timestamp}.${extension}`;
+                // 使用更精确的时间戳 + 索引 + 随机数确保唯一性
+                const now = new Date();
+                const timestamp = now.toISOString().slice(0, 19).replace(/[:-]/g, '');
+                const milliseconds = now.getMilliseconds().toString().padStart(3, '0');
+                const random = Math.random().toString(36).substr(2, 4);
+                filename = `${domain}_img_${index}_${timestamp}_${milliseconds}_${random}.${extension}`;
             } else {
                 // 清理文件名中的特殊字符
                 filename = filename.replace(/[<>:"/\\|?*]/g, '_');
+                // 为原始文件名也添加唯一标识避免重复
+                if (shouldRename) {
+                    const extension = getImageExtension(filename);
+                    const nameWithoutExt = filename.replace(/\.[^/.]+$/, '');
+                    const random = Math.random().toString(36).substr(2, 4);
+                    filename = `${nameWithoutExt}_${random}.${extension}`;
+                }
             }
             
             return filename;
         } catch (e) {
-            return `image_${index}.jpg`;
+            // 备用文件名也要确保唯一性
+            const random = Math.random().toString(36).substr(2, 6);
+            return `image_${index}_${random}.jpg`;
         }
     }
 
@@ -850,6 +1019,35 @@
     function getImageExtension(url) {
         const match = url.match(/\.(jpg|jpeg|png|gif|webp|bmp|svg)($|\?)/i);
         return match ? match[1].toLowerCase() : 'jpg';
+    }
+    
+    // 确保文件名唯一性
+    function ensureUniqueFilename(filename) {
+        let uniqueFilename = filename;
+        let counter = 1;
+        
+        // 如果文件名已存在，添加编号
+        while (downloadedFilenames.has(uniqueFilename.toLowerCase())) {
+            const extension = uniqueFilename.split('.').pop();
+            const nameWithoutExt = uniqueFilename.replace(/\.[^/.]+$/, '');
+            // 移除之前的编号（如果有）
+            const cleanName = nameWithoutExt.replace(/_\d+$/, '');
+            uniqueFilename = `${cleanName}_${counter}.${extension}`;
+            counter++;
+            
+            // 避免无限循环
+            if (counter > 1000) {
+                const random = Math.random().toString(36).substr(2, 8);
+                uniqueFilename = `${cleanName}_${random}.${extension}`;
+                break;
+            }
+        }
+        
+        // 记录该文件名
+        downloadedFilenames.add(uniqueFilename.toLowerCase());
+        console.log('生成唯一文件名:', uniqueFilename);
+        
+        return uniqueFilename;
     }
 
     // 初始化脚本
@@ -868,9 +1066,15 @@
             imageUrls = getAllImageUrls();
             const imageCount = document.getElementById('image-count');
             const downloadBtn = document.getElementById('download-btn');
+            const downloadedCount = document.getElementById('downloaded-count');
             
             imageCount.textContent = `检测到 ${imageUrls.length} 张图片`;
             downloadBtn.disabled = imageUrls.length === 0;
+            
+            // 更新已下载计数
+            if (downloadedCount) {
+                downloadedCount.textContent = `(已下载: ${downloadedHashesSet.size})`;
+            }
         });
 
         // 下载按钮事件
@@ -906,7 +1110,8 @@
                 disableScrollMonitor();
                 // 清空已下载记录
                 downloadedImagesBloom.clear();
-                downloadedImagesSet.clear();
+                downloadedHashesSet.clear();
+                downloadedUrlsSet.clear();
             }
         });
 
@@ -915,6 +1120,30 @@
             cancelAutoDownload();
             disableScrollMonitor();
             container.remove();
+        });
+        
+        // 清空历史记录按钮事件
+        document.getElementById('clear-history-btn').addEventListener('click', () => {
+            if (confirm('确定要清空所有已下载记录吗？这将允许重新下载之前下载过的图片。')) {
+                // 清空布隆过滤器和集合
+                downloadedImagesBloom.clear();
+                downloadedHashesSet.clear();
+                downloadedUrlsSet.clear();
+                
+                // 清空存储
+                GM_setValue('downloadedHashesBloom', null);
+                GM_setValue('downloadedHashesSet', []);
+                GM_setValue('downloadedUrlsSet', []);
+                
+                // 更新界面显示
+                const downloadedCount = document.getElementById('downloaded-count');
+                if (downloadedCount) {
+                    downloadedCount.textContent = '(已下载: 0)';
+                }
+                
+                console.log('✨ 已清空所有下载记录');
+                alert('已清空下载记录！');
+            }
         });
 
         // 自动扫描一次

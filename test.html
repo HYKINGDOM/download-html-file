@@ -84,8 +84,11 @@
                 <li><strong>CSS背景图片</strong> - 通过CSS background-image设置的图片</li>
                 <li><strong>懒加载图片</strong> - 使用data-src属性的图片</li>
                 <li><strong>不同格式</strong> - JPG、PNG、GIF、WebP等格式</li>
+                <li><strong>滚动加载</strong> - 模拟瀑布流和无限滚动加载</li>
+                <li><strong>文件大小测试</strong> - 不同尺寸的图片测试过滤功能</li>
             </ul>
             <p><strong>使用方法：</strong>安装油猴脚本后刷新此页面，右上角会出现图片下载器界面。</p>
+            <p><strong>新增测试：</strong>开启“🚀 自动下载模式”后，慢慢向下滚动页面测试滚动监听功能。</p></p>
         </div>
 
         <div class="section">
@@ -155,13 +158,49 @@
         </div>
 
         <div class="section">
+            <h2>📊 文件大小测试区域</h2>
+            <p>以下图片用于测试文件大小过滤功能：</p>
+            <div class="image-grid">
+                <div class="image-item">
+                    <img src="https://via.placeholder.com/50x50/FF0000/FFFFFF?text=Small" alt="小图片">
+                    <p>小图片 (50x50)</p>
+                </div>
+                <div class="image-item">
+                    <img src="https://via.placeholder.com/150x150/00FF00/FFFFFF?text=Medium" alt="中等图片">
+                    <p>中等图片 (150x150)</p>
+                </div>
+                <div class="image-item">
+                    <img src="https://via.placeholder.com/800x600/0000FF/FFFFFF?text=Large" alt="大图片">
+                    <p>大图片 (800x600)</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>🔄 滚动加载测试区域</h2>
+            <p>向下滚动可以触发动态加载更多图片（模拟瀑布流效果）：</p>
+            <div id="scroll-images"></div>
+            <div style="text-align: center; margin: 20px;">
+                <button id="load-more-btn" style="
+                    background: #007cba;
+                    color: white;
+                    border: none;
+                    padding: 10px 20px;
+                    border-radius: 5px;
+                    cursor: pointer;
+                ">加载更多图片</button>
+            </div>
+        </div>
+
+        <div class="section">
             <h2>📊 统计信息</h2>
             <p>本页面包含的图片资源：</p>
             <ul>
-                <li>IMG标签图片：<strong>9张</strong></li>
-                <li>CSS背景图片：<strong>4张</strong></li>
+                <li>IMG标签图片：<strong>13张</strong>(包含基础图片、文件大小测试图片)</li>
+                <li>CSS背景图片：<strong>6张</strong>(包含动态添加)</li>
                 <li>懒加载图片：<strong>2张</strong></li>
-                <li>总计：<strong>15张</strong>图片</li>
+                <li>动态加载图片：<strong>可变</strong>(点击加载更多)</li>
+                <li>总计：<strong>21+张</strong>图片</li>
             </ul>
             <p><em>注意：实际检测数量可能因网络状况和图片可访问性而有所不同。</em></p>
         </div>
@@ -177,6 +216,10 @@
                 <li>确认检测到的图片数量</li>
                 <li>点击"下载全部"测试批量下载功能</li>
                 <li>观察下载进度和完成提示</li>
+                <li>🆕 <strong>测试自动下载模式</strong>：勾选"🚀 自动下载模式"</li>
+                <li>🆕 <strong>测试滚动监听</strong>：开启自动模式后向下滚动页面</li>
+                <li>🆕 <strong>测试动态加载</strong>：点击"加载更多图片"按钮</li>
+                <li>🆕 <strong>测试文件过滤</strong>：修改文件大小阈值设置</li>
             </ol>
         </div>
     </div>
@@ -228,6 +271,48 @@
                 container.appendChild(dynamicDiv2);
             }
         }, 2000);
+
+        // 动态加载更多图片功能
+        let dynamicImageCount = 14; // 当前静态图片计数
+        
+        function loadMoreImages() {
+            const scrollContainer = document.getElementById('scroll-images');
+            if (!scrollContainer) return;
+            
+            for (let i = 0; i < 5; i++) {
+                const imageDiv = document.createElement('div');
+                imageDiv.className = 'image-item';
+                imageDiv.style.cssText = 'display: inline-block; margin: 10px; text-align: center;';
+                
+                imageDiv.innerHTML = `
+                    <img src="https://picsum.photos/200/150?random=${dynamicImageCount + i}" 
+                         alt="动态图片${dynamicImageCount + i}" 
+                         style="border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1);">
+                    <p>动态图片 ${dynamicImageCount + i}</p>
+                `;
+                
+                scrollContainer.appendChild(imageDiv);
+            }
+            
+            dynamicImageCount += 5;
+            
+            // 更新按钮文本
+            const loadBtn = document.getElementById('load-more-btn');
+            if (loadBtn) {
+                loadBtn.textContent = `加载更多图片 (已加载 ${dynamicImageCount - 14} 张)`;
+            }
+        }
+        
+        // 绑定加载更多按钮事件
+        document.addEventListener('DOMContentLoaded', function() {
+            const loadBtn = document.getElementById('load-more-btn');
+            if (loadBtn) {
+                loadBtn.addEventListener('click', loadMoreImages);
+            }
+            
+            // 初始加载一些图片
+            setTimeout(loadMoreImages, 1000);
+        });
     </script>
 </body>
 </html>
