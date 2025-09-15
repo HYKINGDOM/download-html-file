@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页图片批量下载器
 // @namespace    http://tampermonkey.net/
-// @version      1.4
+// @version      1.5
 // @description  自动检测并下载当前网页中的所有图片资源，支持自动下载模式、滚动监听懒加载图片、文件大小过滤和智能去重
 // @author       You
 // @match        *://*/*
@@ -13,10 +13,138 @@
 (function() {
     'use strict';
 
+    // 布隆过滤器实现
+    class BloomFilter {
+        constructor(expectedElements = 10000, falsePositiveRate = 0.01) {
+            this.expectedElements = expectedElements;
+            this.falsePositiveRate = falsePositiveRate;
+            
+            // 计算最优的位数组大小和哈希函数数量
+            this.bitArraySize = Math.ceil(-(expectedElements * Math.log(falsePositiveRate)) / (Math.log(2) ** 2));
+            this.hashFunctions = Math.ceil((this.bitArraySize / expectedElements) * Math.log(2));
+            
+            // 使用Uint8Array来存储位数组，每个字节存储8位
+            this.bitArray = new Uint8Array(Math.ceil(this.bitArraySize / 8));
+            
+            console.log(`布隆过滤器初始化: 位数组大小=${this.bitArraySize}, 哈希函数数量=${this.hashFunctions}`);
+        }
+        
+        // 简单的哈希函数实现
+        hash1(str) {
+            let hash = 0;
+            for (let i = 0; i < str.length; i++) {
+                const char = str.charCodeAt(i);
+                hash = ((hash << 5) - hash) + char;
+                hash = hash & hash; // 转换为32位整数
+            }
+            return Math.abs(hash) % this.bitArraySize;
+        }
+        
+        hash2(str) {
+            let hash = 5381;
+            for (let i = 0; i < str.length; i++) {
+                hash = ((hash << 5) + hash) + str.charCodeAt(i);
+            }
+            return Math.abs(hash) % this.bitArraySize;
+        }
+        
+        hash3(str) {
+            let hash = 0;
+            for (let i = 0; i < str.length; i++) {
+                hash = str.charCodeAt(i) + ((hash << 6) + (hash << 16) - hash);
+            }
+            return Math.abs(hash) % this.bitArraySize;
+        }
+        
+        // 获取多个哈希值
+        getHashes(item) {
+            const hashes = [];
+            const hash1 = this.hash1(item);
+            const hash2 = this.hash2(item);
+            const hash3 = this.hash3(item);
+            
+            hashes.push(hash1);
+            hashes.push(hash2);
+            
+            // 使用双重哈希生成更多哈希函数
+            for (let i = 2; i < this.hashFunctions; i++) {
+                const combinedHash = (hash1 + i * hash2 + i * i * hash3) % this.bitArraySize;
+                hashes.push(Math.abs(combinedHash));
+            }
+            
+            return hashes;
+        }
+        
+        // 设置位
+        setBit(index) {
+            const byteIndex = Math.floor(index / 8);
+            const bitIndex = index % 8;
+            this.bitArray[byteIndex] |= (1 << bitIndex);
+        }
+        
+        // 获取位
+        getBit(index) {
+            const byteIndex = Math.floor(index / 8);
+            const bitIndex = index % 8;
+            return (this.bitArray[byteIndex] & (1 << bitIndex)) !== 0;
+        }
+        
+        // 添加元素到布隆过滤器
+        add(item) {
+            const hashes = this.getHashes(item);
+            hashes.forEach(hash => this.setBit(hash));
+        }
+        
+        // 检查元素是否可能存在
+        mightContain(item) {
+            const hashes = this.getHashes(item);
+            return hashes.every(hash => this.getBit(hash));
+        }
+        
+        // 获取当前填充率（用于调试）
+        getFillRatio() {
+            let setBits = 0;
+            for (let i = 0; i < this.bitArray.length; i++) {
+                for (let j = 0; j < 8; j++) {
+                    if (this.bitArray[i] & (1 << j)) {
+                        setBits++;
+                    }
+                }
+            }
+            return setBits / this.bitArraySize;
+        }
+        
+        // 序列化为字符串（用于持久化存储）
+        serialize() {
+            return {
+                bitArray: Array.from(this.bitArray),
+                bitArraySize: this.bitArraySize,
+                hashFunctions: this.hashFunctions,
+                expectedElements: this.expectedElements,
+                falsePositiveRate: this.falsePositiveRate
+            };
+        }
+        
+        // 从序列化数据恢复
+        static deserialize(data) {
+            const filter = new BloomFilter(data.expectedElements, data.falsePositiveRate);
+            filter.bitArray = new Uint8Array(data.bitArray);
+            filter.bitArraySize = data.bitArraySize;
+            filter.hashFunctions = data.hashFunctions;
+            return filter;
+        }
+        
+        // 清空过滤器
+        clear() {
+            this.bitArray = new Uint8Array(Math.ceil(this.bitArraySize / 8));
+        }
+    }
+
     // 全局变量
     let autoDownloadEnabled = GM_getValue('autoDownloadEnabled', false);
     let autoDownloadTimer = null;
-    let downloadedImages = new Set(); // 记录已下载的图片URL，避免重复下载
+    let downloadedImagesBloom = null; // 布隆过滤器实例
+    let downloadedImagesSet = new Set(); // 备用精确检查集合（用于小数据量或关键检查）
     let scrollMonitorEnabled = false; // 滚动监听状态
     let scrollTimer = null; // 滚动节流定时器
     let observer = null; // Intersection Observer 实例
@@ -370,12 +498,85 @@
         }, 500); // 500ms延迟检测
     }
 
+    // 初始化布隆过滤器
+    function initializeBloomFilter() {
+        try {
+            // 尝试从存储中恢复布隆过滤器
+            const savedFilter = GM_getValue('downloadedImagesBloom', null);
+            if (savedFilter) {
+                downloadedImagesBloom = BloomFilter.deserialize(savedFilter);
+                console.log('布隆过滤器已从存储中恢复，填充率:', (downloadedImagesBloom.getFillRatio() * 100).toFixed(2) + '%');
+            } else {
+                downloadedImagesBloom = new BloomFilter(10000, 0.01);
+                console.log('创建新的布隆过滤器');
+            }
+            
+            // 恢复精确检查集合（用于小数据量时的备用检查）
+            const savedSet = GM_getValue('downloadedImagesSet', []);
+            downloadedImagesSet = new Set(savedSet);
+            
+        } catch (e) {
+            console.error('初始化布隆过滤器失败:', e);
+            downloadedImagesBloom = new BloomFilter(10000, 0.01);
+            downloadedImagesSet = new Set();
+        }
+    }
+    
+    // 保存布隆过滤器到存储
+    function saveBloomFilter() {
+        try {
+            GM_setValue('downloadedImagesBloom', downloadedImagesBloom.serialize());
+            // 只保存最近的1000个URL到精确集合中
+            const setArray = Array.from(downloadedImagesSet);
+            const recentUrls = setArray.slice(-1000);
+            GM_setValue('downloadedImagesSet', recentUrls);
+        } catch (e) {
+            console.error('保存布隆过滤器失败:', e);
+        }
+    }
+    
+    // 检查图片是否已下载（使用布隆过滤器优化）
+    function isAlreadyDownloaded(url) {
+        const normalizedUrl = normalizeUrl(url);
+        
+        // 首先使用布隆过滤器进行快速检查
+        if (!downloadedImagesBloom.mightContain(normalizedUrl)) {
+            // 布隆过滤器说不存在，那就肯定不存在
+            return false;
+        }
+        
+        // 布隆过滤器说可能存在，进行精确检查
+        // 优先使用内存中的Set进行检查（最快）
+        if (downloadedImagesSet.has(normalizedUrl)) {
+            return true;
+        }
+        
+        // 如果布隆过滤器说存在但Set中没有，可能是误报
+        // 这里我们认为不存在，避免漏下载
+        return false;
+    }
+    
+    // 添加图片到已下载列表
+    function markAsDownloaded(url) {
+        const normalizedUrl = normalizeUrl(url);
+        
+        // 添加到布隆过滤器
+        downloadedImagesBloom.add(normalizedUrl);
+        
+        // 添加到精确检查集合
+        downloadedImagesSet.add(normalizedUrl);
+        
+        // 定期保存到存储
+        if (downloadedImagesSet.size % 50 === 0) {
+            saveBloomFilter();
+        }
+    }
+
     // 检测新图片并下载
     function checkNewImagesAndDownload() {
         const currentImageUrls = getAllImageUrls();
         const newImages = currentImageUrls.filter(url => {
-            const normalizedUrl = normalizeUrl(url);
-            return !downloadedImages.has(normalizedUrl);
+            return !isAlreadyDownloaded(url);
         });
         
         if (newImages.length > 0) {
@@ -419,9 +620,8 @@
             const result = await downloadImage(url, filename);
             if (result.success) {
                 successful++;
-                // 下载成功后记录标准化的URL
-                const normalizedUrl = normalizeUrl(url);
-                downloadedImages.add(normalizedUrl);
+                // 下载成功后记录到布隆过滤器
+                markAsDownloaded(url);
             } else if (result.skipped) {
                 skipped++;
             }
@@ -545,8 +745,7 @@
         if (!isAutoMode) {
             filteredUrls = [];
             for (const url of imageUrls) {
-                const normalizedUrl = normalizeUrl(url);
-                if (!downloadedImages.has(normalizedUrl)) {
+                if (!isAlreadyDownloaded(url)) {
                     filteredUrls.push(url);
                 } else {
                     duplicateCount++;
@@ -589,9 +788,8 @@
             const result = await downloadImage(url, filename);
             if (result.success) {
                 successful++;
-                // 下载成功后记录URL
-                const normalizedUrl = normalizeUrl(url);
-                downloadedImages.add(normalizedUrl);
+                // 下载成功后记录到布隆过滤器
+                markAsDownloaded(url);
             } else if (result.skipped) {
                 skipped++;
             }
@@ -707,7 +905,8 @@
                 cancelAutoDownload();
                 disableScrollMonitor();
                 // 清空已下载记录
-                downloadedImages.clear();
+                downloadedImagesBloom.clear();
+                downloadedImagesSet.clear();
             }
         });
 
@@ -722,6 +921,9 @@
         setTimeout(() => {
             document.getElementById('scan-btn').click();
         }, 1000);
+        
+        // 初始化布隆过滤器
+        initializeBloomFilter();
         
         // 如果开启了自动下载模式，则检查是否需要自动下载
         if (autoDownloadEnabled) {
